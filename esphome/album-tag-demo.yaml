@@ -1,8 +1,10 @@
 # Standalone demo for the WT32-SC01 album tag reader. The screen shows the
 # album most recently started from a card like a music player: cover, the track
 # that is probably playing with a progress bar, the next track, and a heart
-# button. Tapping a card previews that card for a few seconds. It does not connect to Home Assistant and does
-# not start playback.
+# button. Tapping a card plays it the same way the album tag reader does (a
+# tag scan posted to the Album Cards server), showing the card's album until
+# the new album takes over as now playing. It doesn't connect to Home
+# Assistant.
 #
 # "Now playing" comes from the Album Cards server: the card with playback
 # triggered and the newest updatedAt. Editing a card also bumps updatedAt, and
@@ -26,6 +28,8 @@ substitutions:
   # Without a track list, show "Last played" instead of "Started" after this long.
   playing_window_s: "7200"
   tap_preview_time: 10s
+  # Like the album tag reader: don't replay the same card within this long.
+  same_tag_cooldown_ms: "120000"
   # Matches Cover Art Archive's 250px thumbnails, so covers draw without scaling.
   cover_size: "250"
   # How often to check Album Cards for a newly started album. Each check
@@ -52,6 +56,11 @@ esp32:
   board: esp-wrover-kit
   framework:
     type: esp-idf
+    advanced:
+      # HTTPS requests nest TLS buffers on the loop task's stack; 8 KB (the
+      # default) overflowed when a tag scan's response led to more requests.
+      # 32 KB is ESPHome's maximum.
+      loop_task_stack_size: 32768
   # Cover art and track lists come over HTTPS; each TLS handshake takes seconds
   # on this chip and blocks the main loop.
   watchdog_timeout: 30s
@@ -648,11 +657,16 @@ display:
         it.print(col_right, times_y, id(font_mono), muted, TextAlign::TOP_RIGHT, clock(length).c_str(), bg);
       };
 
-      // Dot plus short text in the song's row, for when there's no song to show.
-      auto status_line = [&](Color dot, const std::string &text) {
+      // A tiny twinkling sparkle plus short text in the song's row, for when
+      // there's no song to show ("started just now", "starting playback", ...).
+      auto status_line = [&](Color color, const std::string &text) {
         const int y = song_y + line_height(id(font_song)) / 2;
-        it.filled_circle(cover_x + 4, y, 4, dot);
-        it.print(cover_x + 14, y, id(font_mono), muted, TextAlign::CENTER_LEFT, text.c_str(), bg);
+        const float t = ms / 1000.0f;
+        album_tag_demo::Sparkle shape;
+        shape.lean = 0.25f * sinf(t * 1.3f);
+        sparkle(cover_x + 6, y, 6.0f * (0.85f + 0.2f * sinf(t * 3.1f)), color, bg, shape);
+        it.print(cover_x + 18, y, id(font_mono), muted, TextAlign::CENTER_LEFT, text.c_str(), bg);
+        animating = true;
       };
 
       auto footer = [&](const char *tag, const std::string &text) {
@@ -734,12 +748,12 @@ display:
         if (id(tap_title).empty()) {
           status_screen();
         } else {
-          header("CARD TAPPED", false);
+          header(id(tap_play_failed) ? "CAN'T PLAY CARD" : "STARTING ALBUM", false);
           const bool tap_loading = !id(tap_cover_ready) && !id(tap_cover_failed) && !id(tap_cover_url).empty();
           if (tap_loading) loaders.push_back(display::Rect(cover_x, cover_y, cover_size, cover_size));
           cover(id(tap_cover), id(tap_cover_ready), tap_loading);
           info("");
-          status_line(mustard, "card preview");
+          status_line(id(tap_play_failed) ? red : mustard, id(tap_message));
         }
         finish();
         return;
@@ -810,6 +824,11 @@ globals:
     type: std::string
     restore_value: no
     initial_value: '""'
+  # The playing card's tag URL, to recognize it when it's scanned again.
+  - id: now_tag_url
+    type: std::string
+    restore_value: no
+    initial_value: '""'
   - id: now_cover_url
     type: std::string
     restore_value: no
@@ -873,6 +892,32 @@ globals:
     initial_value: "0"
 
   # Tapped card preview.
+  # The scan being played, and what to show about it.
+  - id: tap_uid
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: tap_url
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: tap_message
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: tap_play_failed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Last card played, for the same-card cooldown.
+  - id: last_played_tag_key
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: last_played_at
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
   - id: pending_tap_url
     type: std::string
     restore_value: no
@@ -952,15 +997,6 @@ globals:
     type: std::string
     restore_value: no
     initial_value: '""'
-  # ETag of the last card list, sent back as If-None-Match.
-  - id: cards_etag
-    type: std::string
-    restore_value: no
-    initial_value: '""'
-  - id: cards_etag_warned
-    type: bool
-    restore_value: no
-    initial_value: "false"
   # FNV-1a hash of the last card list that was parsed.
   - id: cards_hash
     type: uint32_t
@@ -1017,6 +1053,85 @@ globals:
     restore_value: no
 
 script:
+  # Runs refresh_cards from the main loop rather than inside another HTTP
+  # request's callback, so the requests don't nest on the stack.
+  - id: refresh_cards_soon
+    mode: restart
+    then:
+      - delay: 1ms
+      - script.execute: refresh_cards
+
+  # Plays the scanned card the same way the album tag reader does: posts the
+  # scan to Album Cards, which starts the album. On success, the preview ends
+  # and the card list is re-read right away so the new album takes over;
+  # otherwise the card is looked up so the preview can show which album it is.
+  - id: play_tag
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (id(tap_uid).empty()) return false;
+              // Recently played from this reader.
+              if (id(last_played_tag_key) == id(tap_uid) && millis() - id(last_played_at) <= ${same_tag_cooldown_ms})
+                return false;
+              // The album that's already playing (and hasn't finished).
+              if (!id(tap_url).empty() && id(tap_url) == id(now_tag_url)) {
+                auto now = id(sntp_time).now();
+                uint32_t album_s = 0;
+                for (uint32_t length : id(track_lengths_s)) album_s += length;
+                if (album_s == 0) album_s = ${playing_window_s};
+                if (now.is_valid() && (int64_t) now.timestamp - id(now_started_at) < album_s) return false;
+              }
+              return true;
+          then:
+            - http_request.post:
+                url: ${album_cards_base_url}/api/hardware/tag-scans
+                request_headers:
+                  Content-Type: application/json
+                capture_response: false
+                json: |-
+                  root["device"] = "${name}";
+                  root["tagUid"] = id(tap_uid);
+                  if (!id(tap_url).empty()) {
+                    root["tagUrl"] = id(tap_url);
+                  }
+                on_response:
+                  then:
+                    - lambda: |-
+                        ESP_LOGI("album_tag_demo", "Tag scan %s: HTTP %d", id(tap_uid).c_str(), response->status_code);
+                        if (response->status_code == 200) {
+                          id(last_played_tag_key) = id(tap_uid);
+                          id(last_played_at) = millis();
+                          id(tap_message) = "playing";
+                          id(showing_tap) = false;
+                        } else {
+                          id(tap_message) = response->status_code == 404 ? "unknown album card" : "couldn't start playback";
+                          id(tap_play_failed) = true;
+                        }
+                    - if:
+                        condition:
+                          lambda: "return !id(showing_tap);"
+                        then:
+                          - script.stop: end_tap_preview
+                          - lambda: "id(pending_tap_url).clear();"
+                    - script.execute: refresh_cards_soon
+                on_error:
+                  then:
+                    - lambda: |-
+                        id(tap_message) = "Album Cards unreachable";
+                        id(tap_play_failed) = true;
+                    - script.execute: refresh_cards_soon
+          else:
+            # Scanned again within the cooldown, or it's the album that's already
+            # playing: just stay on the now-playing screen.
+            - lambda: |-
+                ESP_LOGI("album_tag_demo", "Skipped recently played tag %s", id(tap_uid).c_str());
+                id(showing_tap) = false;
+                id(pending_tap_url).clear();
+            - script.stop: end_tap_preview
+      - lambda: "album_tag_demo::update_screen(id(screen));"
+
   # Redraws only the moving parts of the screen (see the display lambda), and
   # logs how long that takes.
   - id: draw_partial
@@ -1075,30 +1190,14 @@ script:
       - http_request.get:
           url: ${album_cards_base_url}/api/cards
           capture_response: false
-          # Lets the server answer "304 Not Modified" (no body) when the card
-          # list hasn't changed, if it supports ETags.
-          request_headers:
-            If-None-Match: !lambda "return id(cards_etag).c_str();"
-          collect_headers:
-            - etag
           on_response:
             then:
               - lambda: |-
-                  if (response->status_code == 304) {
-                    id(cards_changed) = false;
-                    ESP_LOGD("album_tag_demo", "Cards unchanged (304) in %u ms", (unsigned) (millis() - id(poll_started_ms)));
-                    return;
-                  }
                   if (response->status_code != 200) {
                     id(status_text) = "Album Cards error " + std::to_string(response->status_code);
                     id(status_kind) = 3;
                     id(cards_changed) = true;
                     return;
-                  }
-                  id(cards_etag) = response->get_response_header("etag");
-                  if (id(cards_etag).empty() && !id(cards_etag_warned)) {
-                    ESP_LOGI("album_tag_demo", "Album Cards sends no ETag, so every check downloads the full card list");
-                    id(cards_etag_warned) = true;
                   }
 
                   auto &body = id(http_body);
@@ -1130,7 +1229,7 @@ script:
 
                   const uint32_t downloaded_ms = millis();
 
-                  // The server has no ETag, so fingerprint the list instead and
+                  // The server sends no ETag, so fingerprint the list instead and
                   // skip the ~0.5 s parse when nothing changed (most polls).
                   uint32_t hash = 2166136261u;
                   for (uint8_t byte : body) hash = (hash ^ byte) * 16777619u;
@@ -1185,6 +1284,7 @@ script:
                         id(now_artist) = card["artist"] | "";
                         id(now_cover_url) = card["coverArtUrl"] | "";
                         id(now_release_mbid) = card["releaseMbid"] | "";
+                        id(now_tag_url) = card["tagUrl"] | "";
                         found_now = true;
                       }
                       if (tap_pending && !found_tap && id(pending_tap_url) == (card["tagUrl"] | "")) {
@@ -1392,6 +1492,10 @@ pn532_spi:
           ESP_LOGI("album_tag_demo", "Read tag %s URL %s", x.c_str(), url.c_str());
 
           id(showing_tap) = true;
+          id(tap_uid) = x;
+          id(tap_url) = url;
+          id(tap_message) = "starting playback";
+          id(tap_play_failed) = false;
           id(tap_title).clear();
           id(tap_cover_url).clear();
           id(tap_cover_ready) = false;
@@ -1401,13 +1505,11 @@ pn532_spi:
             id(status_text) = "This card has no album link";
             id(status_kind) = 3;
           } else {
-            id(status_text) = "Looking up card...";
+            id(status_text) = "Looking up album...";
             id(status_kind) = 1;
           }
       - lambda: "album_tag_demo::update_screen(id(screen));"
       - script.execute: end_tap_preview
-      - if:
-          condition:
-            lambda: "return !id(pending_tap_url).empty();"
-          then:
-            - script.execute: refresh_cards
+      # Play first (that's what people tapped for); play_tag looks the card up
+      # for the preview only if it can't play it.
+      - script.execute: play_tag
