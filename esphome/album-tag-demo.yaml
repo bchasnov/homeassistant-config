@@ -144,9 +144,9 @@ i2c:
     scan: false
 
 # Community hearts: anyone can tap the heart beside the album title (or
-# double-tap anywhere) to add a heart to the album. Each tap pops the heart and
-# rains hearts down the screen. Counts are kept per album in RAM only (not
-# shown yet), so they reset on reboot.
+# double-tap anywhere) to add a heart to the album. Each tap pops the heart and,
+# like Periscope's likes, floats a colorful heart up from it. Counts are kept
+# per album in RAM only (not shown yet), so they reset on reboot.
 touchscreen:
   - platform: ft63x6
     id: touch_panel
@@ -171,7 +171,8 @@ touchscreen:
           const uint32_t count = ++id(heart_counts)[key];
           id(heart_flash_until) = t + 350;
           id(heart_due) = true;
-          album_tag_demo::Overlay::get().start_hearts();
+          // Periscope-style: a heart floats up from the heart button.
+          album_tag_demo::Overlay::get().start_hearts(id(heart_x), id(heart_y));
           ESP_LOGI("album_tag_demo", "Heart %u for %s", (unsigned) count, key.c_str());
       - script.execute: draw_partial
 

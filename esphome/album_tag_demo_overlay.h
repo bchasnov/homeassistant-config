@@ -2,8 +2,8 @@
 // Drawing helpers for album-tag-demo.yaml.
 //
 // - The mural's four-point sparkle as an anti-aliased parametric shape.
-// - An overlay task that animates the loaders (~30 fps) and the heart rain
-//   (~60 fps) by sending pixels straight to the panel. It runs on
+// - An overlay task that animates the loaders (~30 fps) and the floating
+//   hearts (~60 fps) by sending pixels straight to the panel. It runs on
 //   the other core, so it keeps moving while the main loop is stuck in a slow
 //   HTTPS download. Every normal screen update goes through update_screen(),
 //   which shares a lock with the task so the two never talk to the panel at once.
@@ -186,24 +186,44 @@ class Overlay {
   // it thinks are already on the panel.
   void invalidate() { this->resend_all_ = true; }
 
-  // Rains hearts down the whole screen. Tapping again during the rain sends
-  // a fresh shower.
-  void start_hearts() {
+  // Floats one heart up from (x, y), Periscope style: it blooms in (0.2 ->
+  // 1.1 -> 1.0 scale over the first 300 ms), drifts up a random S-curve of
+  // two cubic Beziers, slowly turns toward a random tilt of up to ~14 deg, and
+  // fades out linearly over 3 s. Each heart gets a random bright color with a
+  // white outline. One heart per tap, so quick taps make a stream. Timings
+  // and shapes follow the open-source Periscope clones tyrantgit/HeartLayout
+  // (Android) and saidmarouf/FloatingHearts (iOS).
+  void start_hearts(int x, int y) {
     if (this->screen_ == nullptr)
       return;
     this->lock();
-    const uint32_t now = millis_();
+    // Reuse a finished slot, or the oldest heart if every slot is busy.
+    Heart *slot = &this->hearts_[0];
     for (auto &heart : this->hearts_) {
-      heart.x = (float) (esp_random() % this->screen_w_);
-      heart.size = 8.0f + (esp_random() % 900) / 100.0f;
-      heart.start_ms = now + esp_random() % 700;
-      heart.speed = 220.0f + esp_random() % 140;
-      heart.sway = 4.0f + (esp_random() % 1000) / 100.0f;
-      heart.sway_hz = 1.0f + (esp_random() % 150) / 100.0f;
-      heart.phase = (esp_random() % 628) / 100.0f;
-      heart.color = esp_random() % 3;
-      heart.drawn = false;
+      if (!heart.active) {
+        slot = &heart;
+        break;
+      }
+      if ((int32_t) (heart.start_ms - slot->start_ms) < 0)
+        slot = &heart;
     }
+    auto rnd = [](int range) { return (int) (esp_random() % (uint32_t) range); };
+    Heart &heart = *slot;
+    if (heart.active && heart.drawn)
+      this->restore_.push_back(heart.last);
+    heart.x0 = (float) x;
+    heart.y0 = (float) y;
+    const float travel = std::min((float) y - 24.0f, 170.0f + rnd(110) + 6.0f * this->active_hearts_());
+    heart.y2 = y - travel;
+    heart.y1 = y - travel / 2;
+    heart.x1 = x - 22 + rnd(44);
+    heart.x2 = x - 22 + rnd(44);
+    heart.bend = travel / 6;  // control points a sixth of the way along
+    heart.turn = (rnd(2861) - 1430) / 100.0f * (float) M_PI / 180;  // +-14.3 deg
+    heart.color = (uint8_t) rnd(sizeof(HEART_COLORS) / sizeof(HEART_COLORS[0]));
+    heart.start_ms = millis_();
+    heart.active = true;
+    heart.drawn = false;
     this->hearts_active_ = true;
     this->unlock();
   }
@@ -213,12 +233,21 @@ class Overlay {
     int x = 0, y = 0, w = 0, h = 0;
   };
   struct Heart {
-    float x, size, speed, sway, sway_hz, phase;
+    float x0, y0, x1, y1, x2, y2;  // start, middle, and end of the S-curve
+    float bend;                    // vertical offset of the Bezier control points
+    float turn;                    // final rotation, radians
     uint32_t start_ms;
     uint8_t color;
-    bool drawn;   // whether `last` is on the panel and needs restoring
-    Box last;     // where it was drawn last frame
+    bool active = false;
+    bool drawn = false;  // whether `last` is on the panel and needs restoring
+    Box last;            // where it was drawn last frame
   };
+  // Periscope-clone palette (FloatingHearts): coral, indigo, mint, pink, sky,
+  // lavender, orange, teal, yellow.
+  static constexpr uint32_t HEART_COLORS[] = {0xe66f5e, 0x6a69a0, 0x81cc88, 0xfd3870, 0x6ecff6,
+                                               0xc0aaf7, 0xf7603b, 0x39d3d3, 0xfed301};
+  static constexpr uint32_t HEART_MS = 3000;
+  static constexpr float HEART_WIDTH = 26.0f;  // px at full size
   // Reaches the display's protected frame buffer.
   template<typename D> struct FrameBuffer : D {
     static uint16_t *get(D *display) { return reinterpret_cast<uint16_t *>(static_cast<FrameBuffer *>(display)->buffer_); }
@@ -535,84 +564,136 @@ class Overlay {
     return Color((v >> 8) & 0xF8, (v >> 3) & 0xFC, (v << 3) & 0xF8);
   }
 
-  // --- Heart rain. Each frame restores the patch each heart covered last frame
-  // from the frame buffer, draws every heart touching it, and sends just that
-  // patch to the panel.
+  // --- Floating hearts. Each frame restores the patch each heart covered last
+  // frame from the frame buffer, draws every heart touching it, and sends just
+  // that patch to the panel.
 
-  // Where a heart is at time `now`, or false once it's fallen off the screen.
-  bool heart_box_(const Heart &heart, uint32_t now, Box &box, float &hx, float &hy) const {
-    const float t = (now - heart.start_ms) / 1000.0f;
-    hy = heart.speed * t;  // bottom tip, falling from the top edge
-    hx = heart.x + heart.sway * sinf(2 * M_PI * heart.sway_hz * t + heart.phase);
-    if (hy - heart.size * 1.15f >= this->screen_h_)
+  int active_hearts_() const {
+    int n = 0;
+    for (const auto &heart : this->hearts_)
+      n += heart.active;
+    return n;
+  }
+
+  struct HeartPose {
+    float x, y, scale, angle, alpha;
+    Box box;
+  };
+
+  // Where a heart is at `now`, or false once its 3 s are up.
+  bool heart_pose_(const Heart &heart, uint32_t now, HeartPose &pose) const {
+    const float f = (now - heart.start_ms) / (float) HEART_MS;
+    if (f >= 1.0f)
       return false;
-    box.x = std::max(0, (int) floorf(hx - heart.size * 0.65f));
-    box.y = std::max(0, (int) floorf(hy - heart.size * 1.15f));
-    box.w = std::min(this->screen_w_ - 1, (int) ceilf(hx + heart.size * 0.65f)) - box.x + 1;
-    box.h = std::min(this->screen_h_ - 1, (int) ceilf(hy + 1)) - box.y + 1;
-    return box.w > 0 && box.h > 0;
+    // Two cubic Beziers: start -> middle -> end, each with vertical control
+    // points `bend` away, so the heart sways side to side as it rises.
+    auto cubic = [](float a, float b, float c, float d, float t) {
+      const float u = 1 - t;
+      return u * u * u * a + 3 * u * u * t * b + 3 * u * t * t * c + t * t * t * d;
+    };
+    if (f < 0.5f) {
+      const float t = f * 2;
+      pose.x = cubic(heart.x0, heart.x0, heart.x1, heart.x1, t);
+      pose.y = cubic(heart.y0, heart.y0 - heart.bend, heart.y1 + heart.bend, heart.y1, t);
+    } else {
+      const float t = (f - 0.5f) * 2;
+      pose.x = cubic(heart.x1, heart.x1, heart.x2, heart.x2, t);
+      pose.y = cubic(heart.y1, heart.y1 - heart.bend, heart.y2 + heart.bend, heart.y2, t);
+    }
+    const float ms = f * HEART_MS;
+    pose.scale = ms < 200 ? 0.2f + 0.9f * ms / 200 : ms < 300 ? 1.1f - 0.1f * (ms - 200) / 100 : 1.0f;
+    pose.angle = heart.turn * f;
+    pose.alpha = 1.0f - f;
+    const int r = (int) ceilf(HEART_WIDTH * 0.75f * pose.scale) + 2;
+    pose.box.x = std::max(0, (int) pose.x - r);
+    pose.box.y = std::max(0, (int) pose.y - r);
+    pose.box.w = std::min(this->screen_w_, (int) pose.x + r + 1) - pose.box.x;
+    pose.box.h = std::min(this->screen_h_, (int) pose.y + r + 1) - pose.box.y;
+    return pose.box.w > 0 && pose.box.h > 0;
+  }
+
+  // Blends one heart (fill plus a white outline, faded by its alpha) into the
+  // pixels of `patch` that are in rows [y0, y0 + rows).
+  void paint_heart_(const Heart &heart, const HeartPose &pose, const Box &patch, int y0, int rows) {
+    const Color fill = Color(HEART_COLORS[heart.color] >> 16, (HEART_COLORS[heart.color] >> 8) & 0xFF,
+                             HEART_COLORS[heart.color] & 0xFF);
+    const Color white(255, 255, 255);
+    const float unit = HEART_WIDTH / 1.2f * pose.scale;  // px per unit heart (it's ~1.2 wide)
+    const float c = cosf(pose.angle), s = sinf(pose.angle);
+    const float outline = 1.6f;
+    const int ys = std::max(pose.box.y, y0), ye = std::min(pose.box.y + pose.box.h, y0 + rows);
+    const int xs = std::max(pose.box.x, patch.x), xe = std::min(pose.box.x + pose.box.w, patch.x + patch.w);
+    for (int y = ys; y < ye; y++) {
+      for (int x = xs; x < xe; x++) {
+        const float dx = x + 0.5f - pose.x, dy = y + 0.5f - pose.y;
+        const float rx = dx * c + dy * s, ry = -dx * s + dy * c;  // undo the rotation
+        const float d = heart_distance(rx / unit, 0.55f - ry / unit) * unit;
+        const float cover = std::min(1.0f, 0.5f - d) * pose.alpha;
+        if (cover <= 0.0f)
+          continue;
+        const Color color = blend(white, fill, -d - outline + 0.5f);
+        uint16_t &px = this->chunk_[(y - y0) * patch.w + (x - patch.x)];
+        px = to_panel(blend(from_panel_(px), color, cover));
+      }
+    }
   }
 
   void draw_hearts_() {
     const uint32_t now = millis_();
-    const Color colors[3] = {Color(242, 78, 62), Color(230, 172, 62), Color(246, 241, 231)};
     constexpr int N = sizeof(this->hearts_) / sizeof(this->hearts_[0]);
-    Box now_box[N];
-    float now_x[N], now_y[N];
+    HeartPose pose[N];
     bool visible[N];
-    bool any_left = false;
     for (int i = 0; i < N; i++) {
-      const Heart &heart = this->hearts_[i];
-      const bool started = (int32_t) (now - heart.start_ms) >= 0;
-      visible[i] = started && this->heart_box_(heart, now, now_box[i], now_x[i], now_y[i]);
-      any_left |= visible[i] || !started;
+      visible[i] = this->hearts_[i].active && this->heart_pose_(this->hearts_[i], now, pose[i]);
+      if (!visible[i] && this->hearts_[i].active && this->hearts_[i].drawn)
+        this->restore_.push_back(this->hearts_[i].last);  // finished: clear its last spot
+      if (!visible[i])
+        this->hearts_[i].active = this->hearts_[i].drawn = false;
     }
+    // Oldest first, so newer hearts draw on top.
+    int order[N];
+    for (int i = 0; i < N; i++)
+      order[i] = i;
+    std::sort(order, order + N, [&](int a, int b) {
+      return (int32_t) (this->hearts_[a].start_ms - this->hearts_[b].start_ms) < 0;
+    });
 
+    std::vector<Box> patches = std::move(this->restore_);
+    this->restore_.clear();
     for (int i = 0; i < N; i++) {
-      Heart &heart = this->hearts_[i];
-      if (!visible[i] && !heart.drawn)
+      if (!visible[i])
         continue;
-      // Patch = last frame's spot plus this frame's.
-      Box patch = heart.drawn ? heart.last : now_box[i];
-      if (heart.drawn && visible[i]) {
-        const int x2 = std::max(patch.x + patch.w, now_box[i].x + now_box[i].w);
-        const int y2 = std::max(patch.y + patch.h, now_box[i].y + now_box[i].h);
-        patch.x = std::min(patch.x, now_box[i].x);
-        patch.y = std::min(patch.y, now_box[i].y);
+      Heart &heart = this->hearts_[i];
+      Box patch = pose[i].box;
+      if (heart.drawn) {  // also cover where it was last frame
+        const int x2 = std::max(patch.x + patch.w, heart.last.x + heart.last.w);
+        const int y2 = std::max(patch.y + patch.h, heart.last.y + heart.last.h);
+        patch.x = std::min(patch.x, heart.last.x);
+        patch.y = std::min(patch.y, heart.last.y);
         patch.w = x2 - patch.x;
         patch.h = y2 - patch.y;
       }
-      for (int y0 = patch.y; y0 < patch.y + patch.h; y0 += CHUNK_ROWS * MAX_WIDTH / std::max(1, patch.w)) {
-        const int rows = std::min(CHUNK_ROWS * MAX_WIDTH / std::max(1, patch.w), patch.y + patch.h - y0);
+      patches.push_back(patch);
+      heart.drawn = true;
+      heart.last = pose[i].box;
+    }
+
+    for (const Box &patch : patches) {
+      const int band = std::max(1, CHUNK_ROWS * MAX_WIDTH / std::max(1, patch.w));
+      for (int y0 = patch.y; y0 < patch.y + patch.h; y0 += band) {
+        const int rows = std::min(band, patch.y + patch.h - y0);
         for (int r = 0; r < rows; r++)
           memcpy(&this->chunk_[r * patch.w], &this->screen_[(y0 + r) * this->screen_w_ + patch.x],
                  patch.w * sizeof(uint16_t));
-        // Every visible heart overlapping this patch, so overlaps stay correct.
-        for (int j = 0; j < N; j++) {
-          if (!visible[j])
-            continue;
-          const Box &b = now_box[j];
-          const int ys = std::max(b.y, y0), ye = std::min(b.y + b.h, y0 + rows);
-          const int xs = std::max(b.x, patch.x), xe = std::min(b.x + b.w, patch.x + patch.w);
-          const float scale = this->hearts_[j].size;
-          for (int y = ys; y < ye; y++) {
-            for (int x = xs; x < xe; x++) {
-              const float d = heart_distance((x + 0.5f - now_x[j]) / scale, (now_y[j] - (y + 0.5f)) / scale) * scale;
-              const float cover = 0.5f - d;
-              if (cover <= 0.0f)
-                continue;
-              uint16_t &px = this->chunk_[(y - y0) * patch.w + (x - patch.x)];
-              const Color color = colors[this->hearts_[j].color];
-              px = cover >= 1.0f ? to_panel(color) : to_panel(blend(from_panel_(px), color, cover));
-            }
-          }
+        for (int k = 0; k < N; k++) {
+          const int j = order[k];
+          if (visible[j])
+            this->paint_heart_(this->hearts_[j], pose[j], patch, y0, rows);
         }
         this->blit_(patch.x, y0, patch.w, rows, this->chunk_);
       }
-      heart.drawn = visible[i];
-      heart.last = now_box[i];
     }
-    if (!any_left)
+    if (this->active_hearts_() == 0 && this->restore_.empty())
       this->hearts_active_ = false;
   }
 
@@ -632,7 +713,8 @@ class Overlay {
   uint16_t *screen_{nullptr};
   int screen_w_{0}, screen_h_{0};
   bool hearts_active_{false};
-  Heart hearts_[20];
+  Heart hearts_[24];
+  std::vector<Box> restore_;  // spots of hearts that just finished or were replaced
 };
 
 // Redraws the screen through the display lambda without racing the overlay task.
