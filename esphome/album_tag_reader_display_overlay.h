@@ -1,5 +1,5 @@
 #pragma once
-// Drawing helpers for album-tag-demo.yaml.
+// Drawing helpers for album-tag-reader-display.yaml.
 //
 // - The mural's four-point sparkle as an anti-aliased parametric shape.
 // - An overlay task that animates the loaders (~30 fps) and the floating
@@ -29,7 +29,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
-namespace album_tag_demo {
+namespace album_tag_reader_display {
 
 using esphome::Color;
 
@@ -724,4 +724,4 @@ inline void update_screen(esphome::display::Display *display) {
   Overlay::get().unlock();
 }
 
-}  // namespace album_tag_demo
+}  // namespace album_tag_reader_display

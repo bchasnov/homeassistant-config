@@ -1,4 +1,4 @@
-# Standalone demo for the WT32-SC01 album tag reader. The screen shows the
+# WT32-SC01 album tag reader with a now-playing display. The screen shows the
 # album most recently started from a card like a music player: cover, the track
 # that is probably playing with a progress bar, the next track, and a heart
 # button. Tapping a card plays it the same way the album tag reader does (a
@@ -14,8 +14,8 @@
 # track lengths from MusicBrainz, assuming it plays straight through from
 # track 1 with no pauses or skips.
 substitutions:
-  name: album-tag-demo
-  friendly_name: "Album Tag Demo"
+  name: album-tag-reader-display
+  friendly_name: "Album Tag Reader Display"
   album_cards_base_url: "http://192.168.67.2:8099"
   # PN532 in SPI mode, like the album tag reader and programmer, on free pins
   # of the WT32-SC01 expansion header (the Feather pins those use are taken
@@ -43,13 +43,13 @@ esphome:
   friendly_name: ${friendly_name}
   # The mural sparkle, and the task that animates the cover area.
   includes:
-    - album_tag_demo_overlay.h
+    - album_tag_reader_display_overlay.h
   on_boot:
     priority: -100
     then:
       - lambda: |-
-          album_tag_demo::Overlay::get().start(id(screen));
-          album_tag_demo::update_screen(id(screen));
+          album_tag_reader_display::Overlay::get().start(id(screen));
+          album_tag_reader_display::update_screen(id(screen));
 
 # WT32-SC01 (ESP32-WROVER-B, 4MB flash, 8MB PSRAM). Not the SC01 Plus (ESP32-S3).
 esp32:
@@ -70,7 +70,7 @@ psram:
 logger:
 
 # No api: block, so there is no Home Assistant connection and no encryption key.
-# OTA has no password; anyone on the LAN could flash this demo.
+# OTA has no password; anyone on the LAN could flash this device.
 ota:
   - platform: esphome
 
@@ -82,13 +82,13 @@ wifi:
     - lambda: |-
         id(status_text) = "Loading albums...";
         id(status_kind) = 1;
-    - lambda: "album_tag_demo::update_screen(id(screen));"
+    - lambda: "album_tag_reader_display::update_screen(id(screen));"
     - script.execute: refresh_cards
   on_disconnect:
     - lambda: |-
         id(status_text) = "Connecting to Wi-Fi...";
         id(status_kind) = 4;
-    - lambda: "album_tag_demo::update_screen(id(screen));"
+    - lambda: "album_tag_reader_display::update_screen(id(screen));"
 
 time:
   - platform: sntp
@@ -181,8 +181,8 @@ touchscreen:
           id(heart_flash_until) = t + 350;
           id(heart_due) = true;
           // Periscope-style: a heart floats up from the heart button.
-          album_tag_demo::Overlay::get().start_hearts(id(heart_x), id(heart_y));
-          ESP_LOGI("album_tag_demo", "Heart %u for %s", (unsigned) count, key.c_str());
+          album_tag_reader_display::Overlay::get().start_hearts(id(heart_x), id(heart_y));
+          ESP_LOGI("album_tag_reader_display", "Heart %u for %s", (unsigned) count, key.c_str());
       - script.execute: draw_partial
 
 http_request:
@@ -191,7 +191,7 @@ http_request:
   buffer_size_rx: 2048
   buffer_size_tx: 1024
   # MusicBrainz requires an identifying User-Agent.
-  useragent: "EBMC-AlbumTagDemo/0.1 ( https://albums.eastbaymakers.club )"
+  useragent: "EBMC-AlbumTagReaderDisplay/0.1 ( https://albums.eastbaymakers.club )"
 
 output:
   - platform: ledc
@@ -277,15 +277,15 @@ image:
     on_download_finished:
       - lambda: |-
           id(now_cover_ready) = true;
-          ESP_LOGI("album_tag_demo", "Cover downloaded in %u ms (%u ms after the album changed)",
+          ESP_LOGI("album_tag_reader_display", "Cover downloaded in %u ms (%u ms after the album changed)",
                    (unsigned) (millis() - id(cover_requested_ms)), (unsigned) (millis() - id(album_changed_ms)));
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
     on_error:
       - lambda: |-
           id(now_cover_ready) = false;
           id(now_cover_failed) = true;
-          ESP_LOGW("album_tag_demo", "Now-playing cover download failed");
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+          ESP_LOGW("album_tag_reader_display", "Now-playing cover download failed");
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
 
   # Cover of the card that was just tapped.
   - platform: online_image
@@ -296,13 +296,13 @@ image:
     resize: ${cover_size}x${cover_size}
     on_download_finished:
       - lambda: "id(tap_cover_ready) = true;"
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
     on_error:
       - lambda: |-
           id(tap_cover_ready) = false;
           id(tap_cover_failed) = true;
-          ESP_LOGW("album_tag_demo", "Tapped card cover download failed");
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+          ESP_LOGW("album_tag_reader_display", "Tapped card cover download failed");
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
 
 display:
   - platform: mipi_spi
@@ -349,12 +349,12 @@ display:
       // the strip with the song, bar, times, and next track; region 2 the header
       // sparkle; region 3 the heart button. Everything else gets a full frame.
       // The cover area is animated separately by the overlay task (see
-      // album_tag_demo_overlay.h).
+      // album_tag_reader_display_overlay.h).
       const int region = id(partial_region);
       const bool partial = region != 0;
       const int star_x = col_right - 10, star_y = 21;
       bool animating = false, star_animating = false, heart_animating = false;
-      // Areas the overlay task animates with the loader (see album_tag_demo_overlay.h).
+      // Areas the overlay task animates with the loader (see album_tag_reader_display_overlay.h).
       std::vector<display::Rect> loaders;
 
       auto text_width = [&](font::Font *font, const std::string &s) -> int {
@@ -470,10 +470,10 @@ display:
         return out;
       };
 
-      // The mural sparkle, anti-aliased (see album_tag_demo_overlay.h).
+      // The mural sparkle, anti-aliased (see album_tag_reader_display_overlay.h).
       auto sparkle = [&](int x, int y, float size, Color color, Color under,
-                         const album_tag_demo::Sparkle &shape = album_tag_demo::Sparkle()) {
-        album_tag_demo::draw_sparkle(it, x, y, size, shape, color, under);
+                         const album_tag_reader_display::Sparkle &shape = album_tag_reader_display::Sparkle()) {
+        album_tag_reader_display::draw_sparkle(it, x, y, size, shape, color, under);
       };
 
       // Anti-aliased heart about `size` px wide, centered on (hx, hy); outline
@@ -484,11 +484,11 @@ display:
         const int r = (int) ceilf(size * 0.6f) + 2;
         for (int y = hy - r; y <= hy + r; y++) {
           for (int x = hx - r; x <= hx + r; x++) {
-            float d = album_tag_demo::heart_distance((x + 0.5f - hx) / scale, (tip_y - (y + 0.5f)) / scale) * scale;
+            float d = album_tag_reader_display::heart_distance((x + 0.5f - hx) / scale, (tip_y - (y + 0.5f)) / scale) * scale;
             if (outline) d = fabsf(d + 1.0f) - 1.0f;
             const float cover = 0.5f - d;
             if (cover <= 0.0f) continue;
-            it.draw_pixel_at(x, y, cover >= 1.0f ? color : album_tag_demo::blend(bg, color, cover));
+            it.draw_pixel_at(x, y, cover >= 1.0f ? color : album_tag_reader_display::blend(bg, color, cover));
           }
         }
       };
@@ -542,7 +542,7 @@ display:
         static uint32_t since = 0;
         if (playing && !was_playing) since = ms;
         was_playing = playing;
-        album_tag_demo::Sparkle shape;
+        album_tag_reader_display::Sparkle shape;
         float size = 10.0f;
         if (playing) {
           const float t = (ms - since) / 1000.0f;
@@ -662,7 +662,7 @@ display:
       auto status_line = [&](Color color, const std::string &text) {
         const int y = song_y + line_height(id(font_song)) / 2;
         const float t = ms / 1000.0f;
-        album_tag_demo::Sparkle shape;
+        album_tag_reader_display::Sparkle shape;
         shape.lean = 0.25f * sinf(t * 1.3f);
         sparkle(cover_x + 6, y, 6.0f * (0.85f + 0.2f * sinf(t * 3.1f)), color, bg, shape);
         it.print(cover_x + 18, y, id(font_mono), muted, TextAlign::CENTER_LEFT, text.c_str(), bg);
@@ -714,7 +714,7 @@ display:
 
       bool clipping = false;
       auto finish = [&]() {
-        auto &overlay = album_tag_demo::Overlay::get();
+        auto &overlay = album_tag_reader_display::Overlay::get();
         overlay.set_loading(loaders);
         if (!partial) overlay.invalidate();
         id(anim_active) = animating;
@@ -723,7 +723,7 @@ display:
         if (clipping) {
           it.end_clipping();
         } else if (!partial) {
-          ESP_LOGD("album_tag_demo", "Full frame drawn in %u ms", (unsigned) (millis() - ms));
+          ESP_LOGD("album_tag_reader_display", "Full frame drawn in %u ms", (unsigned) (millis() - ms));
         }
       };
 
@@ -1099,7 +1099,7 @@ script:
                 on_response:
                   then:
                     - lambda: |-
-                        ESP_LOGI("album_tag_demo", "Tag scan %s: HTTP %d", id(tap_uid).c_str(), response->status_code);
+                        ESP_LOGI("album_tag_reader_display", "Tag scan %s: HTTP %d", id(tap_uid).c_str(), response->status_code);
                         if (response->status_code == 200) {
                           id(last_played_tag_key) = id(tap_uid);
                           id(last_played_at) = millis();
@@ -1126,11 +1126,11 @@ script:
             # Scanned again within the cooldown, or it's the album that's already
             # playing: just stay on the now-playing screen.
             - lambda: |-
-                ESP_LOGI("album_tag_demo", "Skipped recently played tag %s", id(tap_uid).c_str());
+                ESP_LOGI("album_tag_reader_display", "Skipped recently played tag %s", id(tap_uid).c_str());
                 id(showing_tap) = false;
                 id(pending_tap_url).clear();
             - script.stop: end_tap_preview
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
 
   # Redraws only the moving parts of the screen (see the display lambda), and
   # logs how long that takes.
@@ -1140,7 +1140,7 @@ script:
           const uint32_t start = millis();
           auto draw = [](int region) {
             id(partial_region) = region;
-            album_tag_demo::update_screen(id(screen));
+            album_tag_reader_display::update_screen(id(screen));
             id(partial_region) = 0;
           };
           if (id(force_full)) {
@@ -1164,7 +1164,7 @@ script:
           id(partial_total_ms) += took;
           id(partial_max_ms) = std::max(id(partial_max_ms), took);
           if (start - id(partial_stats_since) >= 10000) {
-            ESP_LOGI("album_tag_demo", "Partial frames: %u in 10s, avg %u ms, max %u ms", id(partial_frames),
+            ESP_LOGI("album_tag_reader_display", "Partial frames: %u in 10s, avg %u ms, max %u ms", id(partial_frames),
                      id(partial_frames) ? id(partial_total_ms) / id(partial_frames) : 0, id(partial_max_ms));
             id(partial_frames) = 0;
             id(partial_total_ms) = 0;
@@ -1177,7 +1177,7 @@ script:
     then:
       - delay: ${tap_preview_time}
       - lambda: "id(showing_tap) = false;"
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
 
   # Album Cards has no "now playing" or single-card endpoint, so fetch the whole
   # card list (~100 KB) into PSRAM. One pass finds the most recently started
@@ -1234,7 +1234,7 @@ script:
                   uint32_t hash = 2166136261u;
                   for (uint8_t byte : body) hash = (hash ^ byte) * 16777619u;
                   if (hash == id(cards_hash) && id(pending_tap_url).empty()) {
-                    ESP_LOGD("album_tag_demo", "Cards unchanged (%u bytes, download %u ms)", body.size(),
+                    ESP_LOGD("album_tag_reader_display", "Cards unchanged (%u bytes, download %u ms)", body.size(),
                              (unsigned) (downloaded_ms - id(poll_started_ms)));
                     body.clear();
                     id(cards_changed) = false;
@@ -1273,7 +1273,7 @@ script:
                                                                DeserializationOption::Filter(filter));
                     App.feed_wdt();
                     if (err) {
-                      ESP_LOGW("album_tag_demo", "Could not parse cards: %s", err.c_str());
+                      ESP_LOGW("album_tag_reader_display", "Could not parse cards: %s", err.c_str());
                     }
                     for (JsonObject card : doc["cards"].as<JsonArray>()) {
                       const char *playback = card["hardware"]["playback"] | "idle";
@@ -1297,7 +1297,7 @@ script:
                   }
                   const uint32_t parsed_ms = millis();
                   const bool changed = found_now && (id(now_title) != previous_title || id(now_release_mbid) != previous_release);
-                  ESP_LOGI("album_tag_demo", "Cards: %u bytes, download %u ms, parse %u ms; now playing: %s%s",
+                  ESP_LOGI("album_tag_reader_display", "Cards: %u bytes, download %u ms, parse %u ms; now playing: %s%s",
                            body.size(), (unsigned) (downloaded_ms - id(poll_started_ms)),
                            (unsigned) (parsed_ms - downloaded_ms), found_now ? id(now_title).c_str() : "(none)",
                            changed ? " (changed)" : "");
@@ -1349,7 +1349,7 @@ script:
                   condition:
                     lambda: "return id(cards_changed);"
                   then:
-                    - lambda: "album_tag_demo::update_screen(id(screen));"
+                    - lambda: "album_tag_reader_display::update_screen(id(screen));"
               # Only re-download the now-playing cover when the album changes.
               - if:
                   condition:
@@ -1383,7 +1383,7 @@ script:
                   id(pending_tap_url).clear();
                   id(status_text) = "Album Cards API unreachable";
                   id(status_kind) = 3;
-              - lambda: "album_tag_demo::update_screen(id(screen));"
+              - lambda: "album_tag_reader_display::update_screen(id(screen));"
 
   # Track titles and lengths for the now-playing release, from MusicBrainz.
   - id: fetch_tracks
@@ -1403,9 +1403,9 @@ script:
             then:
               - lambda: |-
                   id(tracks_loading) = false;
-                  ESP_LOGI("album_tag_demo", "MusicBrainz responded in %u ms", (unsigned) (millis() - id(tracks_requested_ms)));
+                  ESP_LOGI("album_tag_reader_display", "MusicBrainz responded in %u ms", (unsigned) (millis() - id(tracks_requested_ms)));
                   if (response->status_code != 200) {
-                    ESP_LOGW("album_tag_demo", "MusicBrainz returned %d", response->status_code);
+                    ESP_LOGW("album_tag_reader_display", "MusicBrainz returned %d", response->status_code);
                     // Retry on the next card refresh.
                     id(tracks_release_mbid).clear();
                     return;
@@ -1425,7 +1425,7 @@ script:
                     App.feed_wdt();
                   }
 
-                  ESP_LOGI("album_tag_demo", "MusicBrainz release: %u bytes", body.size());
+                  ESP_LOGI("album_tag_reader_display", "MusicBrainz release: %u bytes", body.size());
                   JsonDocument filter;
                   JsonObject track_filter = filter["media"][0]["tracks"].add<JsonObject>();
                   track_filter["title"] = true;
@@ -1438,7 +1438,7 @@ script:
                   body.clear();
                   body.shrink_to_fit();
                   if (err) {
-                    ESP_LOGW("album_tag_demo", "Could not parse MusicBrainz release: %s", err.c_str());
+                    ESP_LOGW("album_tag_reader_display", "Could not parse MusicBrainz release: %s", err.c_str());
                     return;
                   }
 
@@ -1457,14 +1457,14 @@ script:
                       break;
                     }
                   }
-                  ESP_LOGI("album_tag_demo", "Loaded %u tracks %u ms after the album changed",
+                  ESP_LOGI("album_tag_reader_display", "Loaded %u tracks %u ms after the album changed",
                            id(track_lengths_s).size(), (unsigned) (millis() - id(album_changed_ms)));
-              - lambda: "album_tag_demo::update_screen(id(screen));"
+              - lambda: "album_tag_reader_display::update_screen(id(screen));"
           on_error:
             then:
               - lambda: |-
                   id(tracks_loading) = false;
-                  ESP_LOGW("album_tag_demo", "Could not reach MusicBrainz");
+                  ESP_LOGW("album_tag_reader_display", "Could not reach MusicBrainz");
                   id(tracks_release_mbid).clear();
 
 pn532_spi:
@@ -1489,7 +1489,7 @@ pn532_spi:
               }
             }
           }
-          ESP_LOGI("album_tag_demo", "Read tag %s URL %s", x.c_str(), url.c_str());
+          ESP_LOGI("album_tag_reader_display", "Read tag %s URL %s", x.c_str(), url.c_str());
 
           id(showing_tap) = true;
           id(tap_uid) = x;
@@ -1508,7 +1508,7 @@ pn532_spi:
             id(status_text) = "Looking up album...";
             id(status_kind) = 1;
           }
-      - lambda: "album_tag_demo::update_screen(id(screen));"
+      - lambda: "album_tag_reader_display::update_screen(id(screen));"
       - script.execute: end_tap_preview
       # Play first (that's what people tapped for); play_tag looks the card up
       # for the preview only if it can't play it.
